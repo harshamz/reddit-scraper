@@ -60,6 +60,10 @@ logs/
 # Streamlit
 .streamlit/secrets.toml
 
+# App data
+leads_tracker.json
+alerts.json
+
 # Jupyter
 .ipynb_checkpoints/
 

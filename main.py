@@ -1,923 +1,748 @@
 import os
 import re
-from datetime import datetime, date, timedelta, timezone
+import time
+import json
+from datetime import datetime, timezone
 from typing import List, Dict, Tuple
+from pathlib import Path
 
+import requests
 import pandas as pd
-import praw
 import streamlit as st
-from dotenv import load_dotenv
 import plotly.express as px
-import plotly.graph_objects as go
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def _get_secret(key: str) -> str:
+    val = os.getenv(key, "")
+    if not val:
+        try:
+            val = st.secrets.get(key, "")
+        except Exception:
+            val = ""
+    return val
+
+SERPER_API_KEY = _get_secret("SERPER_API_KEY")
+SERPER_URL     = "https://google.serper.dev/search"
+LEADS_FILE     = Path("leads_tracker.json")
+ALERTS_FILE    = Path("alerts.json")
 
 
-# ────────────────────────────── env & reddit init ──────────────────────────────
-if os.path.exists(".env"):  # load only in local/dev
-    load_dotenv()
+# ──────────────────────────── Lead Tracker Storage ───────────────────────────
+def load_leads() -> dict:
+    if LEADS_FILE.exists():
+        return json.loads(LEADS_FILE.read_text(encoding="utf-8"))
+    return {}
 
-def init_reddit() -> praw.Reddit:
-    """Create a PRAW `Reddit` instance from env / Streamlit secrets.
-    Shows a helpful message and stops if credentials are missing.
-    """
-    client_id     = os.getenv("REDDIT_CLIENT_ID")     or st.secrets.get("REDDIT_CLIENT_ID")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET") or st.secrets.get("REDDIT_CLIENT_SECRET")
-    user_agent    = os.getenv("REDDIT_USER_AGENT")    or st.secrets.get("REDDIT_USER_AGENT")
+def save_leads(data: dict):
+    LEADS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    missing: list[str] = []
-    if not client_id:
-        missing.append("REDDIT_CLIENT_ID")
-    if not client_secret:
-        missing.append("REDDIT_CLIENT_SECRET")
-    if not user_agent:
-        missing.append("REDDIT_USER_AGENT")
+def load_alerts() -> list:
+    if ALERTS_FILE.exists():
+        return json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
+    return []
 
-    if missing:
-        st.error(
-            "Missing Reddit API credentials: " + ", ".join(missing) +
-            "\n\nPlease add them in Settings → Secrets (or set environment variables)."
-        )
-        st.markdown(
-            "Add these entries in your Streamlit secrets:")
-        st.code(
-            """REDDIT_CLIENT_ID = "your_actual_client_id"
-REDDIT_CLIENT_SECRET = "your_actual_client_secret"
-REDDIT_USER_AGENT = "RedditScraper/1.0 by /u/yourusername""",
-            language="toml",
-        )
-        st.stop()
-
-    return praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
-    )
+def save_alerts(data: list):
+    ALERTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ──────────────────────────── Intelligent Categorization ────────────────────────────
+# ──────────────────────────── Category System ────────────────────────────────
 def get_category_keywords() -> Dict[str, List[str]]:
-    """Define keywords and patterns for each category like GummySearch."""
     return {
         "Pain Points": [
-            "problem", "issue", "struggling", "frustrated", "annoying", "broken", "doesn't work",
-            "hate", "terrible", "awful", "worst", "failing", "difficult", "hard", "impossible",
-            "bug", "error", "crash", "slow", "expensive", "overpriced", "waste", "scam",
+            "problem", "issue", "struggling", "frustrated", "annoying", "broken",
+            "hate", "terrible", "awful", "worst", "failing", "difficult", "impossible",
+            "bug", "error", "crash", "slow", "expensive", "overpriced", "waste",
             "disappointed", "regret", "mistake", "wrong", "bad", "horrible", "sucks",
-            "fix", "solve", "help", "support", "trouble", "stuck", "confused", "lost"
+            "fix", "solve", "help", "support", "trouble", "stuck", "confused"
         ],
         "Solution Requests": [
             "how to", "how do", "how can", "what's the best", "recommend", "suggestion",
-            "advice", "help me", "looking for", "need", "want", "seeking", "search",
-            "alternative", "replacement", "substitute", "instead of", "better than",
-            "tutorial", "guide", "instructions", "step by step", "walkthrough",
-            "best way", "most effective", "proven method", "tips", "tricks", "hacks"
+            "advice", "help me", "looking for", "need", "want", "seeking",
+            "alternative", "replacement", "instead of", "better than",
+            "tutorial", "guide", "best way", "tips", "tricks"
         ],
         "Money Talk": [
             "price", "cost", "expensive", "cheap", "budget", "affordable", "money", "pay",
-            "subscription", "monthly", "yearly", "fee", "charge", "billing", "invoice",
-            "worth it", "value", "roi", "return on investment", "save money", "deal",
-            "discount", "coupon", "promo", "sale", "free", "pricing", "quote", "estimate",
-            "$", "usd", "euro", "pound", "currency", "salary", "income", "revenue", "profit"
+            "subscription", "fee", "charge", "billing", "worth it", "value", "roi",
+            "save money", "deal", "discount", "free", "pricing", "quote", "salary",
+            "$", "usd", "euro", "revenue", "profit"
         ],
         "Hot Discussions": [
-            "trending", "viral", "popular", "everyone", "talking about", "buzz", "hype",
-            "news", "announcement", "update", "release", "launch", "breaking", "controversy",
-            "debate", "argument", "discussion", "thoughts", "opinions", "what do you think",
-            "hot take", "unpopular opinion", "controversial", "drama", "gossip"
+            "trending", "viral", "popular", "everyone", "buzz", "hype", "news",
+            "announcement", "update", "release", "launch", "breaking", "controversy",
+            "debate", "discussion", "thoughts", "opinions", "hot take", "controversial"
         ],
         "Seeking Alternatives": [
-            "alternative", "replacement", "substitute", "instead of", "better than", "similar to",
-            "like", "competitor", "switch from", "migrate", "move away", "leave", "quit",
-            "fed up", "done with", "tired of", "sick of", "switching", "changing",
-            "compare", "vs", "versus", "difference", "which is better", "pros and cons"
+            "alternative", "replacement", "instead of", "better than", "similar to",
+            "competitor", "switch from", "migrate", "leave", "quit", "fed up",
+            "tired of", "switching", "compare", "vs", "versus", "which is better"
+        ],
+        "Hiring / Looking for Service": [
+            "hire", "hiring", "looking for", "need a", "want a", "seeking",
+            "freelancer", "agency", "service", "help wanted", "job", "project",
+            "work with", "collaborate", "outsource", "contractor", "budget is",
+            "pay for", "willing to pay", "dm me", "contact me", "reach out"
         ]
     }
 
-def classify_post_content(title: str, text: str) -> Tuple[str, float]:
-    """
-    Classify a post into one of the GummySearch categories.
-    Returns (category, confidence_score).
-    """
+def classify_post(title: str, snippet: str) -> Tuple[str, float]:
     keywords = get_category_keywords()
-    content = f"{title.lower()} {text.lower()}"
-    
-    # Remove common noise words for better classification
-    noise_words = ["the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"]
-    for word in noise_words:
-        content = re.sub(rf'\b{word}\b', '', content)
-    
-    category_scores = {}
-    
-    for category, category_keywords in keywords.items():
+    content  = f"{title.lower()} {(snippet or '').lower()}"
+    scores   = {}
+    for category, kws in keywords.items():
         score = 0
-        for keyword in category_keywords:
-            # Use regex for better matching
-            pattern = rf'\b{re.escape(keyword.lower())}\b'
-            matches = len(re.findall(pattern, content))
-            score += matches
-            
-            # Boost score for title matches (more important)
-            title_matches = len(re.findall(pattern, title.lower()))
-            score += title_matches * 2
-        
-        category_scores[category] = score
-    
-    # Get the category with highest score
-    if max(category_scores.values()) == 0:
+        for kw in kws:
+            pattern = rf'\b{re.escape(kw.lower())}\b'
+            score  += len(re.findall(pattern, content))
+            score  += len(re.findall(pattern, title.lower())) * 2
+        scores[category] = score
+    if max(scores.values()) == 0:
         return "General Discussion", 0.0
-    
-    best_category = max(category_scores, key=category_scores.get)
-    max_score = category_scores[best_category]
-    
-    # Calculate confidence (normalize by content length and keyword count)
-    total_words = len(content.split())
-    confidence = min(max_score / max(total_words * 0.1, 1), 1.0)
-    
-    return best_category, confidence
+    best = max(scores, key=scores.get)
+    conf = min(scores[best] / max(len(content.split()) * 0.1, 1), 1.0)
+    return best, round(conf, 2)
 
-def get_category_color(category: str) -> str:
-    """Get color for category badges like GummySearch."""
-    colors = {
-        "Pain Points": "#FF4B4B",      # Red
-        "Solution Requests": "#00D4FF", # Blue  
-        "Money Talk": "#00FF88",       # Green
-        "Hot Discussions": "#FF8C00",  # Orange
-        "Seeking Alternatives": "#9966FF", # Purple
-        "General Discussion": "#666666"  # Gray
-    }
-    return colors.get(category, "#666666")
+def category_color(cat: str) -> str:
+    return {
+        "Pain Points":               "#FF4B4B",
+        "Solution Requests":         "#00D4FF",
+        "Money Talk":                "#00FF88",
+        "Hot Discussions":           "#FF8C00",
+        "Seeking Alternatives":      "#9966FF",
+        "Hiring / Looking for Service": "#FFD700",
+        "General Discussion":        "#666666",
+    }.get(cat, "#666666")
 
-def get_category_icon(category: str) -> str:
-    """Get emoji icon for each category."""
-    icons = {
-        "Pain Points": "😣",
-        "Solution Requests": "❓", 
-        "Money Talk": "💰",
-        "Hot Discussions": "🔥",
-        "Seeking Alternatives": "🔄",
-        "General Discussion": "💬"
-    }
-    return icons.get(category, "💬")
+def category_icon(cat: str) -> str:
+    return {
+        "Pain Points":               "😣",
+        "Solution Requests":         "❓",
+        "Money Talk":                "💰",
+        "Hot Discussions":           "🔥",
+        "Seeking Alternatives":      "🔄",
+        "Hiring / Looking for Service": "💼",
+        "General Discussion":        "💬",
+    }.get(cat, "💬")
 
 
-# ─────────────────────── helpers: fetch posts & single thread ──────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_subreddit_posts(
-    _reddit: praw.Reddit,
-    name: str,
-    filter_type: str = "All",
-    start: date | None = None,
-    end:   date | None = None,
-) -> pd.DataFrame:
-    """
-    Scrape **ALL** posts that fall inside the requested window.
-    • “All”, “Last Week”, “Last Month”, “Last Year” use rolling windows  
-    • “Date Range” honours the explicit `start` → `end` span  
-    Note: Reddit’s API caps results at ~1 000 posts per listing; for huge
-    subs you’ll hit that limit unless you integrate Pushshift.
-    """
-    try:
-        sub   = _reddit.subreddit(name)
-        now   = datetime.now(timezone.utc)
-        start_ts, end_ts = 0, now.timestamp()
+# ──────────────────────────── Serper Search ───────────────────────────────────
+def extract_subreddit(url: str) -> str:
+    m = re.search(r'reddit\.com/r/([^/]+)', url)
+    return f"r/{m.group(1)}" if m else "reddit"
 
-        if filter_type == "Last Week":
-            start_ts = (now - timedelta(days=7)).timestamp()
-        elif filter_type == "Last Month":
-            start_ts = (now - timedelta(days=30)).timestamp()
-        elif filter_type == "Last Year":
-            start_ts = (now - timedelta(days=365)).timestamp()
-        elif filter_type == "Date Range" and start and end:
-            start_ts = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp()
-            end_ts   = datetime.combine(end,   datetime.max.time(), tzinfo=timezone.utc).timestamp()
+def extract_username(url: str) -> str:
+    # /r/sub/comments/id/title/ → no username in URL, return empty
+    # We get username from snippet if possible
+    return ""
 
-        rows: list[dict] = []
-        for post in sub.new(limit=None):            # newest → oldest
-            if post.created_utc > end_ts:
-                continue
-            if post.created_utc < start_ts:         # we’re past window → stop
-                break
+TIME_FILTERS = {
+    "This Month": "qdr:m",
+    "This Week":  "qdr:w",
+    "Today":      "qdr:d",
+    "This Year":  "qdr:y",
+    "All Time":   None,
+}
 
-            # Classify the post content
-            category, confidence = classify_post_content(post.title, post.selftext or "")
-            
-            rows.append({
-                "ID":                  post.id,
-                "Title":               post.title,
-                "Post Text":           post.selftext,
-                "Subreddit":           post.subreddit.display_name,
-                "Author":              str(post.author),
-                "Created UTC":         datetime.fromtimestamp(post.created_utc, tz=timezone.utc),
-                "Score":               post.score,
-                "Up-vote Ratio":       post.upvote_ratio,
-                "Total Comments":      post.num_comments,
-                "Total Awards":        post.total_awards_received,
-                "Flair":               post.link_flair_text,
-                "Is Original Content": post.is_original_content,
-                "Over 18":             post.over_18,
-                "Spoiler":             post.spoiler,
-                "Num Cross-posts":     post.num_crossposts,
-                "Permalink":           f"https://www.reddit.com{post.permalink}",
-                "Post URL":            post.url,
-                "Category":            category,
-                "Category Confidence": confidence,
-            })
-        return pd.DataFrame(rows)
+# Platform configs — site filter + label
+PLATFORMS = {
+    "🟠 Reddit":         "site:reddit.com",
+    "🐦 Twitter / X":    "site:x.com",
+    "👥 Facebook Groups": "site:facebook.com/groups",
+    "💼 LinkedIn":       "site:linkedin.com",
+    "🌐 All Platforms":  "",   # no site filter
+}
 
-    except Exception as exc:
-        st.error(f"Error fetching subreddit posts: {exc}")
+def detect_platform(url: str) -> str:
+    if "reddit.com"   in url: return "Reddit"
+    if "x.com"        in url: return "Twitter/X"
+    if "twitter.com"  in url: return "Twitter/X"
+    if "facebook.com" in url: return "Facebook"
+    if "linkedin.com" in url: return "LinkedIn"
+    return "Other"
+
+def serper_search(query: str, num: int = 30, time_filter: str = "qdr:m",
+                  platform: str = "🟠 Reddit") -> pd.DataFrame:
+    if not SERPER_API_KEY:
+        st.error("SERPER_API_KEY missing in .env file!")
         return pd.DataFrame()
 
+    site_filter = PLATFORMS.get(platform, "site:reddit.com")
+    full_query  = f"{site_filter} {query}".strip()
+    rows, fetched, page = [], 0, 1
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_post_by_url(_reddit: praw.Reddit, url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return a DataFrame for the submission + its **entire** comment tree."""
-    try:
-        s = _reddit.submission(url=url)
-        
-        # Classify the post content
-        category, confidence = classify_post_content(s.title, s.selftext or "")
-        
-        post_df = pd.DataFrame([{
-            "ID":            s.id,
-            "Title":         s.title,
-            "Post Text":     s.selftext,
-            "Subreddit":     s.subreddit.display_name,
-            "Author":        str(s.author),
-            "Created UTC":   datetime.fromtimestamp(s.created_utc, tz=timezone.utc),
-            "Score":         s.score,
-            "Up-vote Ratio": s.upvote_ratio,
-            "Total Comments": s.num_comments,
-            "Total Awards":   s.total_awards_received,
-            "Flair":          s.link_flair_text,
-            "Is Original Content": s.is_original_content,
-            "Over 18":            s.over_18,
-            "Spoiler":            s.spoiler,
-            "Num Cross-posts":    s.num_crossposts,
-            "Permalink":          f"https://www.reddit.com{s.permalink}",
-            "Post URL":           s.url,
-            "Category":           category,
-            "Category Confidence": confidence,
-        }])
+    while fetched < num:
+        batch   = min(10, num - fetched)
+        payload = {"q": full_query, "num": batch, "page": page}
+        if time_filter:
+            payload["tbs"] = time_filter
+        try:
+            r = requests.post(
+                SERPER_URL,
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json=payload, timeout=15,
+            )
+            if r.status_code != 200:
+                st.error(f"Serper API error: {r.status_code}")
+                break
+            data     = r.json()
+            results  = data.get("organic", [])
+            if not results:
+                break
+            for item in results:
+                title   = item.get("title", "")
+                link    = item.get("link", "")
+                snippet = item.get("snippet", "")
+                date    = item.get("date", "")
+                cat, conf = classify_post(title, snippet)
+                plat = detect_platform(link)
+                # source label
+                if plat == "Reddit":
+                    source = extract_subreddit(link)
+                elif plat == "Twitter/X":
+                    source = "Twitter/X"
+                elif plat == "Facebook":
+                    source = "Facebook Group"
+                elif plat == "LinkedIn":
+                    source = "LinkedIn"
+                else:
+                    source = plat
+                rows.append({
+                    "Title":      title,
+                    "Snippet":    snippet,
+                    "Platform":   plat,
+                    "Source":     source,
+                    "Date":       date,
+                    "Category":   cat,
+                    "Confidence": conf,
+                    "Link":       link,
+                })
+            fetched += len(results)
+            if len(results) < batch:
+                break
+            page += 1
+            time.sleep(0.3)
+        except Exception as e:
+            st.error(f"Request failed: {e}")
+            break
 
-        s.comments.replace_more(limit=None)
-        comments = [{
-            "Comment ID":   c.id,
-            "Parent ID":    c.parent_id,
-            "Comment Text": c.body,
-            "Author":       str(c.author),
-            "Score":        c.score,
-            "Created UTC":  datetime.fromtimestamp(c.created_utc, tz=timezone.utc),
-            "Permalink":    f"https://www.reddit.com{c.permalink}",
-            "Is Submitter": c.is_submitter,
-        } for c in s.comments.list()]
-
-        return post_df, pd.DataFrame(comments)
-
-    except Exception as exc:
-        st.error(f"Error fetching post: {exc}")
-        return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
-# ──────────────────────────────── Streamlit UI ────────────────────────────────
-def apply_custom_css():
-    """Apply custom CSS for modern dark theme and better styling."""
+# ──────────────────────────── DM Template Generator ──────────────────────────
+DM_TEMPLATES = {
+    "🎯 SMM Clients": (
+        "Hey! I saw your post about needing social media help. "
+        "I'm an SMM specialist and I'd love to help grow your online presence. "
+        "I handle content creation, scheduling, engagement, and analytics. "
+        "Would you be open to a quick chat about your goals? "
+        "Happy to share my portfolio and pricing. 😊"
+    ),
+    "🌐 Website Clients": (
+        "Hi! I noticed you're looking for website help. "
+        "I'm a web developer specializing in clean, fast, and affordable websites. "
+        "I can build anything from landing pages to full business sites. "
+        "Would love to discuss your project — happy to share examples of my work!"
+    ),
+    "🎬 Animation Clients": (
+        "Hey! I came across your post about needing animation work. "
+        "I'm a 2D/motion graphics animator and I'd love to bring your idea to life. "
+        "I create explainer videos, logo animations, and more. "
+        "Can I share my portfolio with you?"
+    ),
+    "Custom Search": (
+        "Hi! I saw your post and I think I can help. "
+        "I specialize in this area and have worked on similar projects. "
+        "Would you be open to a quick chat? Happy to share more details!"
+    ),
+}
+
+def generate_dm(title: str, snippet: str, service_type: str) -> str:
+    return DM_TEMPLATES.get(service_type, DM_TEMPLATES["Custom Search"])
+
+def dm_link(username: str) -> str:
+    if username:
+        return f"https://www.reddit.com/message/compose?to={username}"
+    return ""
+
+
+# ──────────────────────────── SMM Presets ────────────────────────────────────
+SMM_PRESETS = {
+    "🎯 SMM Clients": [
+        "need social media manager",
+        "hire social media manager",
+        "looking for SMM",
+        "manage my social media",
+        "grow my instagram",
+        "social media help needed",
+        "content creator needed",
+    ],
+    "🌐 Website Clients": [
+        "need a website built",
+        "looking for web developer",
+        "hire web designer",
+        "build me a website",
+        "website for my business",
+        "affordable website developer",
+        "need website help",
+    ],
+    "🎬 Animation Clients": [
+        "need animator",
+        "hire animator",
+        "need explainer video",
+        "logo animation needed",
+        "motion graphics needed",
+        "animated video for business",
+        "2d animation needed",
+    ],
+}
+
+STATUS_OPTIONS  = ["🆕 New", "📨 Contacted", "💬 Replied", "✅ Converted", "❌ Not Interested"]
+STATUS_COLORS   = {
+    "🆕 New":            "#666666",
+    "📨 Contacted":      "#00D4FF",
+    "💬 Replied":        "#FF8C00",
+    "✅ Converted":      "#00FF88",
+    "❌ Not Interested": "#FF4B4B",
+}
+
+
+# ──────────────────────────── CSS ─────────────────────────────────────────────
+def apply_css():
     st.markdown("""
     <style>
-    /* Import Google Fonts */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    
-    /* Main theme colors */
     :root {
-        --primary-color: #FF4B4B;
-        --secondary-color: #FF6B6B;
-        --background-dark: #0E1117;
-        --surface-dark: #1A1D23;
-        --surface-light: #262730;
-        --text-primary: #FAFAFA;
-        --text-secondary: #A6A6A6;
-        --accent-blue: #00D4FF;
-        --accent-green: #00FF88;
-        --border-color: #333644;
+        --primary:#FF4B4B; --bg:#0E1117; --surface:#1A1D23;
+        --blue:#00D4FF; --green:#00FF88; --border:#333644; --text:#FAFAFA;
     }
-    
-    /* Main container styling */
-    .stApp {
-        background: linear-gradient(135deg, var(--background-dark) 0%, #1a1d29 100%);
-        font-family: 'Inter', sans-serif;
-    }
-    
-    /* Sidebar styling */
-    .css-1d391kg {
-        background: linear-gradient(180deg, var(--surface-dark) 0%, var(--surface-light) 100%);
-        border-right: 1px solid var(--border-color);
-    }
-    
-    /* Headers and titles */
-    .main-header {
-        background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-size: 2.5rem;
-        font-weight: 700;
-        display: inline-block;
-        vertical-align: middle;
-    }
-    
-    .section-header {
-        color: var(--text-primary);
-        font-size: 1.8rem;
-        font-weight: 600;
-        margin: 1.5rem 0 1rem 0;
-        border-bottom: 2px solid var(--accent-blue);
-        padding-bottom: 0.5rem;
-    }
-    
-    /* Cards and containers */
-    .filter-card {
-        background: var(--surface-dark);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-    }
-    
-    .stats-card {
-        background: linear-gradient(135deg, var(--surface-dark), var(--surface-light));
-        border-radius: 8px;
-        padding: 1rem;
-        text-align: center;
-        border: 1px solid var(--border-color);
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(45deg, var(--primary-color), var(--secondary-color));
-        border: none;
-        border-radius: 8px;
-        color: white;
-        font-weight: 600;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 15px rgba(255, 75, 75, 0.3);
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(255, 75, 75, 0.4);
-    }
-    
-    /* Metrics */
-    .metric-container {
-        background: var(--surface-dark);
-        border-radius: 8px;
-        padding: 1rem;
-        border-left: 4px solid var(--accent-blue);
-    }
-    
-    /* Selectbox and inputs */
-    .stSelectbox > div > div {
-        background: var(--surface-light);
-        border: 1px solid var(--border-color);
-        border-radius: 6px;
-    }
-    
-    .stTextInput > div > div > input {
-        background: var(--surface-light);
-        border: 1px solid var(--border-color);
-        border-radius: 6px;
-        color: var(--text-primary);
-    }
-    
-    /* Success/Error messages */
-    .stSuccess {
-        background: linear-gradient(90deg, var(--accent-green), #00cc77);
-        border-radius: 8px;
-    }
-    
-    .stError {
-        background: linear-gradient(90deg, #ff4757, #ff3742);
-        border-radius: 8px;
-    }
-    
-    /* DataFrame styling */
-    .stDataFrame {
-        border-radius: 8px;
-        overflow: hidden;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-    }
-    
-    /* Advanced filter section */
-    .advanced-filters {
-        background: var(--surface-dark);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-top: 1rem;
-    }
-    
-    .filter-section {
-        margin-bottom: 1rem;
-        padding: 1rem;
-        background: var(--surface-light);
-        border-radius: 8px;
-        border-left: 3px solid var(--accent-blue);
-    }
+    .stApp { background:linear-gradient(135deg,#0E1117 0%,#1a1d29 100%); font-family:'Inter',sans-serif; }
+    .main-header { background:linear-gradient(90deg,#FF4B4B,#FF6B6B);
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+        font-size:2.2rem; font-weight:700; display:inline-block; }
+    .sec-header { color:#FAFAFA; font-size:1.4rem; font-weight:600;
+        border-bottom:2px solid #00D4FF; padding-bottom:0.4rem; margin:1rem 0 0.8rem 0; }
+    .stButton>button { background:linear-gradient(45deg,#FF4B4B,#FF6B6B);
+        border:none; border-radius:8px; color:white; font-weight:600;
+        box-shadow:0 4px 15px rgba(255,75,75,.3); transition:all .3s; }
+    .stButton>button:hover { transform:translateY(-2px); }
+    .lead-card { background:#1A1D23; border:1px solid #333644; border-radius:10px;
+        padding:1rem; margin:0.5rem 0; }
+    a { color:#00D4FF !important; }
     </style>
     """, unsafe_allow_html=True)
 
-def create_category_analytics(df: pd.DataFrame):
-    """Create category distribution analytics like GummySearch."""
+
+# ──────────────────────────── UI Components ───────────────────────────────────
+def show_stats(df: pd.DataFrame):
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📊 Total Results", len(df))
+    src_col = 'Source' if 'Source' in df.columns else ('Subreddit' if 'Subreddit' in df.columns else None)
+    c2.metric("📂 Sources", df[src_col].nunique() if src_col else 0)
+    hiring = len(df[df['Category'] == 'Hiring / Looking for Service']) if 'Category' in df.columns else 0
+    c3.metric("💼 Hiring Posts", hiring)
+    pain = len(df[df['Category'] == 'Pain Points']) if 'Category' in df.columns else 0
+    c4.metric("😣 Pain Points", pain)
+
+def show_categories(df: pd.DataFrame):
     if df.empty or 'Category' not in df.columns:
         return
-    
-    st.markdown('<h3 class="section-header">🏷️ Content Categories</h3>', unsafe_allow_html=True)
-    
-    # Category distribution
-    category_counts = df['Category'].value_counts()
-    
-    # Create category cards
-    cols = st.columns(len(category_counts))
-    for i, (category, count) in enumerate(category_counts.items()):
-        with cols[i % len(cols)]:
-            icon = get_category_icon(category)
-            color = get_category_color(category)
-            percentage = (count / len(df)) * 100
-            
+    st.markdown('<div class="sec-header">🏷️ Content Categories</div>', unsafe_allow_html=True)
+    counts = df['Category'].value_counts()
+    cols   = st.columns(min(len(counts), 4))
+    for i, (cat, count) in enumerate(counts.items()):
+        color = category_color(cat)
+        icon  = category_icon(cat)
+        pct   = count / len(df) * 100
+        with cols[i % min(len(counts), 4)]:
             st.markdown(f"""
-                <div style="
-                    background: linear-gradient(135deg, {color}20, {color}10);
-                    border-left: 4px solid {color};
-                    border-radius: 8px;
-                    padding: 1rem;
-                    margin: 0.5rem 0;
-                    text-align: center;
-                ">
-                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">{icon}</div>
-                    <div style="font-weight: 600; color: {color};">{category}</div>
-                    <div style="font-size: 1.5rem; font-weight: bold; margin: 0.5rem 0;">{count}</div>
-                    <div style="font-size: 0.9rem; opacity: 0.8;">{percentage:.1f}%</div>
-                </div>
-            """, unsafe_allow_html=True)
-    
-    # Category distribution chart
-    fig_categories = px.pie(
-        values=category_counts.values,
-        names=category_counts.index,
+            <div style="background:linear-gradient(135deg,{color}20,{color}10);
+                border-left:4px solid {color};border-radius:8px;padding:0.8rem;
+                margin:0.3rem 0;text-align:center;">
+                <div style="font-size:1.6rem">{icon}</div>
+                <div style="font-weight:600;color:{color};font-size:0.8rem">{cat}</div>
+                <div style="font-size:1.2rem;font-weight:bold">{count}</div>
+                <div style="font-size:0.75rem;opacity:0.8">{pct:.1f}%</div>
+            </div>""", unsafe_allow_html=True)
+    fig = px.pie(
+        values=counts.values, names=counts.index, color=counts.index,
+        color_discrete_map={c: category_color(c) for c in counts.index},
         title="Category Distribution",
-        color=category_counts.index,
-        color_discrete_map={
-            cat: get_category_color(cat) for cat in category_counts.index
-        }
     )
-    fig_categories.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font_color='white'
-    )
-    st.plotly_chart(fig_categories, use_container_width=True)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', font_color='white')
+    st.plotly_chart(fig, use_container_width=True)
 
-def create_stats_dashboard(df: pd.DataFrame):
-    """Create a stats dashboard with key metrics."""
-    if df.empty:
+def show_results_with_dm(df: pd.DataFrame, service_type: str, name: str):
+    st.markdown('<div class="sec-header">📋 Results + DM Actions</div>', unsafe_allow_html=True)
+
+    leads_data = load_leads()
+
+    for i, row in df.iterrows():
+        link    = row.get("Link", "")
+        title   = row.get("Title", "")
+        snippet = row.get("Snippet", "")
+        cat     = row.get("Category", "")
+        sub     = row.get("Source", row.get("Subreddit", ""))
+        plat    = row.get("Platform", "")
+        date    = row.get("Date", "")
+        color   = category_color(cat)
+        icon    = category_icon(cat)
+
+        # Lead status from tracker
+        lead_id     = link
+        lead_info   = leads_data.get(lead_id, {})
+        lead_status = lead_info.get("status", "🆕 New")
+        lead_note   = lead_info.get("note", "")
+
+        with st.container():
+            st.markdown(f"""
+            <div class="lead-card">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="flex:1">
+                        <span style="background:{color}30;color:{color};padding:2px 8px;
+                            border-radius:4px;font-size:0.75rem;font-weight:600;">
+                            {icon} {cat}
+                        </span>
+                        <span style="color:#666;font-size:0.75rem;margin-left:8px;">{plat} • {sub} • {date}</span>
+                        <h4 style="margin:0.4rem 0 0.3rem 0;color:#FAFAFA;">
+                            <a href="{link}" target="_blank" style="text-decoration:none;color:#FAFAFA;">
+                                {title}
+                            </a>
+                        </h4>
+                        <p style="color:#A6A6A6;font-size:0.85rem;margin:0;">{snippet}</p>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+
+            # DM Template button
+            with col1:
+                dm_msg = generate_dm(title, snippet, service_type)
+                st.code(dm_msg[:80] + "...", language=None)
+                st.button("📋 Copy Message", key=f"copy_{i}",
+                          help=dm_msg,
+                          on_click=lambda m=dm_msg: st.session_state.update({"copied_msg": m}))
+
+            # DM Link
+            with col2:
+                st.markdown(f"[💬 Open Reddit Post]({link})", unsafe_allow_html=False)
+                st.markdown("*Username Reddit par post mein milega*", unsafe_allow_html=False)
+
+            # Lead Status
+            with col3:
+                new_status = st.selectbox(
+                    "Status", STATUS_OPTIONS,
+                    index=STATUS_OPTIONS.index(lead_status) if lead_status in STATUS_OPTIONS else 0,
+                    key=f"status_{i}",
+                )
+
+            # Note
+            with col4:
+                new_note = st.text_input("Note", value=lead_note, key=f"note_{i}",
+                                         placeholder="e.g., replied, budget $200")
+
+            # Save to tracker
+            if new_status != lead_status or new_note != lead_note:
+                leads_data[lead_id] = {
+                    "title":   title,
+                    "status":  new_status,
+                    "note":    new_note,
+                    "link":    link,
+                    "saved_at": datetime.now().isoformat(),
+                }
+                save_leads(leads_data)
+
+            # Add to tracker button
+            if st.button("➕ Save Lead", key=f"save_{i}"):
+                leads_data[lead_id] = {
+                    "title":    title,
+                    "status":   new_status,
+                    "note":     new_note,
+                    "link":     link,
+                    "snippet":  snippet,
+                    "saved_at": datetime.now().isoformat(),
+                }
+                save_leads(leads_data)
+                st.success(f"✅ Lead saved!")
+
+            st.divider()
+
+    # Show copied message
+    if "copied_msg" in st.session_state:
+        st.markdown('<div class="sec-header">📋 DM Message (Copy karein)</div>', unsafe_allow_html=True)
+        st.text_area("Message:", value=st.session_state["copied_msg"], height=150, key="msg_display")
+
+    # Download
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("📥 Download CSV", df.to_csv(index=False).encode(),
+                           f"{name}.csv", "text/csv", use_container_width=True)
+    with c2:
+        st.download_button("📥 Download JSON", df.to_json(orient='records').encode(),
+                           f"{name}.json", "application/json", use_container_width=True)
+
+
+def show_lead_tracker():
+    st.markdown('<div class="sec-header">📊 Lead Tracker</div>', unsafe_allow_html=True)
+    leads_data = load_leads()
+
+    if not leads_data:
+        st.info("Koi lead save nahi ki abhi — pehle search karein aur '➕ Save Lead' click karein۔")
         return
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("📊 Total Posts", len(df))
-    with col2:
-        avg_score = df['Score'].mean() if 'Score' in df.columns else 0
-        st.metric("⭐ Avg Score", f"{avg_score:.1f}")
-    with col3:
-        avg_comments = df['Total Comments'].mean() if 'Total Comments' in df.columns else 0
-        st.metric("💬 Avg Comments", f"{avg_comments:.1f}")
-    with col4:
-        total_awards = df['Total Awards'].sum() if 'Total Awards' in df.columns else 0
-        st.metric("🏆 Total Awards", int(total_awards))
 
-def main() -> None:
+    # Stats
+    statuses = [v.get("status", "🆕 New") for v in leads_data.values()]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    for col, status in zip([c1, c2, c3, c4, c5], STATUS_OPTIONS):
+        count = statuses.count(status)
+        color = STATUS_COLORS[status]
+        col.markdown(f"""
+        <div style="background:{color}20;border-left:3px solid {color};
+            border-radius:6px;padding:0.6rem;text-align:center;">
+            <div style="font-weight:bold;font-size:1.3rem">{count}</div>
+            <div style="font-size:0.75rem;color:{color}">{status}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Filter by status
+    filter_status = st.selectbox("Filter by status:", ["All"] + STATUS_OPTIONS)
+
+    for lead_id, info in leads_data.items():
+        if filter_status != "All" and info.get("status") != filter_status:
+            continue
+        status = info.get("status", "🆕 New")
+        color  = STATUS_COLORS.get(status, "#666666")
+        st.markdown(f"""
+        <div style="background:#1A1D23;border-left:4px solid {color};
+            border-radius:8px;padding:0.8rem;margin:0.4rem 0;">
+            <div style="display:flex;justify-content:space-between;">
+                <span style="color:{color};font-weight:600;font-size:0.85rem">{status}</span>
+                <span style="color:#666;font-size:0.75rem">{info.get('saved_at','')[:10]}</span>
+            </div>
+            <a href="{info.get('link','')}" target="_blank"
+               style="color:#FAFAFA;font-weight:500;text-decoration:none;">
+               {info.get('title','')[:80]}
+            </a>
+            <div style="color:#A6A6A6;font-size:0.8rem;margin-top:0.3rem">
+                📝 {info.get('note','—')}
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # Export tracker
+    st.markdown("---")
+    tracker_df = pd.DataFrame([
+        {"Title": v.get("title",""), "Status": v.get("status",""),
+         "Note": v.get("note",""), "Link": v.get("link",""), "Date": v.get("saved_at","")}
+        for v in leads_data.values()
+    ])
+    st.download_button("📥 Export Tracker CSV", tracker_df.to_csv(index=False).encode(),
+                       "leads_tracker.csv", "text/csv", use_container_width=True)
+
+    if st.button("🗑️ Clear All Leads", type="secondary"):
+        save_leads({})
+        st.rerun()
+
+
+def show_daily_alerts():
+    st.markdown('<div class="sec-header">🔔 Daily Auto Alerts</div>', unsafe_allow_html=True)
+    alerts = load_alerts()
+
+    st.markdown("**Yahan keywords save karo — har baar app kholne par naye results dikhenge۔**")
+
+    with st.form("add_alert"):
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            new_kw = st.text_input("Keyword", placeholder="need social media manager")
+        with col2:
+            new_sub = st.text_input("Subreddit", placeholder="forhire (optional)")
+        with col3:
+            new_time = st.selectbox("Time", list(TIME_FILTERS.keys()), index=1)
+        submitted = st.form_submit_button("➕ Add Alert", use_container_width=True)
+        if submitted and new_kw.strip():
+            alerts.append({
+                "keyword":    new_kw.strip(),
+                "subreddit":  new_sub.strip().lstrip("r/"),
+                "time_label": new_time,
+                "added_at":   datetime.now().isoformat(),
+            })
+            save_alerts(alerts)
+            st.success(f"✅ Alert added for: '{new_kw}'")
+            st.rerun()
+
+    if not alerts:
+        st.info("Koi alert nahi — upar se add karein۔")
+        return
+
+    st.markdown("---")
+    st.markdown("**Saved Alerts:**")
+    for i, alert in enumerate(alerts):
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            sub_txt = f" in r/{alert['subreddit']}" if alert.get("subreddit") else " (all Reddit)"
+            st.markdown(f"🔔 **{alert['keyword']}**{sub_txt} — _{alert['time_label']}_")
+        with col2:
+            if st.button("❌", key=f"del_alert_{i}"):
+                alerts.pop(i)
+                save_alerts(alerts)
+                st.rerun()
+
+    st.markdown("---")
+    if st.button("🚀 Run All Alerts Now", use_container_width=True):
+        all_dfs = []
+        prog = st.progress(0, "Running alerts...")
+        for i, alert in enumerate(alerts):
+            prog.progress(int(i / len(alerts) * 100), f"Checking: {alert['keyword']}")
+            q   = f"r/{alert['subreddit']} {alert['keyword']}" if alert.get("subreddit") else alert['keyword']
+            tbs = TIME_FILTERS.get(alert["time_label"])
+            df  = serper_search(q, num=10, time_filter=tbs)
+            if not df.empty:
+                df.insert(0, "Alert Keyword", alert['keyword'])
+                all_dfs.append(df)
+            time.sleep(0.5)
+        prog.progress(100, "Done!")
+        if all_dfs:
+            combined = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["Link"])
+            st.success(f"✅ {len(combined)} new posts found!")
+            st.dataframe(combined[['Alert Keyword','Title','Subreddit','Date','Category','Link']],
+                         use_container_width=True, height=400)
+            st.download_button("📥 Download Results", combined.to_csv(index=False).encode(),
+                               "alert_results.csv", "text/csv")
+        else:
+            st.warning("Koi naya result nahi mila۔")
+
+
+# ──────────────────────────── Main ───────────────────────────────────────────
+def main():
     st.set_page_config(
-        page_title="Reddit Data Scraper",
+        page_title="Reddit SMM Lead Finder",
         page_icon="reddit-logo.png",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
     )
-    
-    apply_custom_css()
-    
-    # Main header with custom logo inline
+    apply_css()
+
+    try:
+        logo = __import__('base64').b64encode(open('reddit-logo.png', 'rb').read()).decode()
+        st.markdown(f'''
+        <div style="display:flex;align-items:center;justify-content:center;margin-bottom:1rem;">
+            <img src="data:image/png;base64,{logo}" width="45" style="margin-right:12px;">
+            <h1 class="main-header" style="margin:0;">Reddit SMM Lead Finder</h1>
+        </div>''', unsafe_allow_html=True)
+    except Exception:
+        st.markdown('<h1 class="main-header">Reddit SMM Lead Finder</h1>', unsafe_allow_html=True)
+
     st.markdown(
-        '''
-        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 2rem;">
-            <img src="data:image/png;base64,{}" width="50" style="margin-right: 15px;">
-            <h1 class="main-header" style="margin: 0;">Reddit Data Scraper</h1>
-        </div>
-        '''.format(
-            __import__('base64').b64encode(open('reddit-logo.png', 'rb').read()).decode()
-        ),
-        unsafe_allow_html=True
+        '<p style="text-align:center;color:#A6A6A6;margin-top:-0.8rem;">'
+        'Find SMM • Website • Animation clients — DM Templates • Lead Tracker • Auto Alerts</p>',
+        unsafe_allow_html=True,
     )
-    
-    reddit = init_reddit()
 
-    # Enhanced sidebar with better organization
-    with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
-        
-        # Mode selection with better styling
-        mode = st.radio(
-            "**Scraping Mode**",
-            ("Subreddit Posts", "Specific Post by URL"),
-            help="Choose what type of data you want to scrape"
-        )
-        
-        st.markdown("---")
-        
-        # Advanced options
-        with st.expander("🔧 Advanced Options"):
-            show_charts = st.checkbox("Show Analytics Charts", value=True)
-            auto_refresh = st.checkbox("Auto-refresh Data", value=False)
-            if auto_refresh:
-                refresh_interval = st.slider("Refresh Interval (minutes)", 1, 60, 5)
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3 = st.tabs(["🔍 Search & Find Leads", "📊 Lead Tracker", "🔔 Daily Alerts"])
 
-    # ── Subreddit mode ─────────────────────────────────────────────────────────
-    if mode == "Subreddit Posts":
-        st.markdown('<h2 class="section-header">🔍 Subreddit Posts Scraper</h2>', unsafe_allow_html=True)
+    # ── Tab 1: Search ─────────────────────────────────────────────────────────
+    with tab1:
+        with st.sidebar:
+            st.markdown("### 🎯 Client Type")
+            preset = st.selectbox("Service:", ["Custom Search"] + list(SMM_PRESETS.keys()))
+            st.markdown("---")
+            st.markdown("### ⚙️ Options")
+            num_results = st.slider("Max Results", 10, 100, 20, 10)
+            show_cats   = st.checkbox("Show Categories", value=True)
+            st.markdown("---")
+            st.markdown("### 📌 Best Subreddits")
+            st.markdown("- `r/forhire`\n- `r/slavelabour`\n- `r/hiring`\n"
+                        "- `r/smallbusiness`\n- `r/Entrepreneur`\n- `r/socialmedia`")
 
-        # Main input section with better layout
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            sub_name = st.text_input(
-                "**Subreddit Name**",
-                value="",
-                placeholder="e.g., selfhosted, programming, technology",
-                help="Enter the name of the subreddit without 'r/'"
+        st.markdown('<div class="sec-header">🔍 Search Reddit for Clients</div>', unsafe_allow_html=True)
+
+        if preset != "Custom Search":
+            st.info(f"Preset: **{preset}**")
+            kw_cols = st.columns(min(len(SMM_PRESETS[preset]), 4))
+            sel_kw  = st.session_state.get("preset_kw", SMM_PRESETS[preset][0])
+            for i, kw in enumerate(SMM_PRESETS[preset]):
+                if kw_cols[i % 4].button(kw, key=f"pkw_{i}"):
+                    st.session_state["preset_kw"] = kw
+                    sel_kw = kw
+            default_kw = sel_kw
+        else:
+            default_kw = ""
+
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            keywords_input = st.text_area(
+                "**Keywords** (ek line mein ek — ya comma se alag karein)",
+                value=default_kw,
+                placeholder="need social media manager\nhire animator\nbuild me a website",
+                height=110,
             )
-        with col2:
-            max_posts = st.number_input(
-                "**Max Posts**",
-                min_value=10,
-                max_value=1000,
-                value=100,
-                step=10,
-                help="Maximum number of posts to fetch"
-            )
+        with c2:
+            time_label = st.selectbox("**Time Filter**", list(TIME_FILTERS.keys()), index=0)
+        with c3:
+            platform = st.selectbox("**Platform**", list(PLATFORMS.keys()), index=0)
 
-        # Enhanced filter section
-        st.markdown("**📅 Date & Time Filters**")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            filter_opt = st.selectbox(
-                "Time Period",
-                ("All", "Last Week", "Last Month", "Last Year", "Date Range"),
-                help="Select the time period for post filtering"
-            )
-        with col2:
-            sort_option = st.selectbox(
-                "Sort By",
-                ("New", "Hot", "Top", "Rising"),
-                help="Choose how posts should be sorted"
+        # Subreddit filter — sirf Reddit ke liye show karo
+        sub_filter = ""
+        if platform == "🟠 Reddit":
+            sub_filter = st.text_input(
+                "**Subreddit filter** (optional)",
+                placeholder="forhire  (khali chhodo = poora Reddit)",
             )
 
-        start_d = end_d = None
-        if filter_opt == "Date Range":
-            col1, col2 = st.columns(2)
-            with col1:
-                start_d = st.date_input("Start date", value=date.today() - timedelta(days=7))
-            with col2:
-                end_d = st.date_input("End date", value=date.today())
-            if start_d > end_d:
-                st.warning("⚠️ Start date must be before end date.")
+        if st.button("🚀 Find Clients", use_container_width=True):
+            raw           = keywords_input.replace(",", "\n")
+            keywords_list = [k.strip() for k in raw.splitlines() if k.strip()]
 
-        # Content filters
-        with st.expander("🎯 Content Filters"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                min_score = st.number_input("Min Score", value=0, help="Minimum post score")
-                include_nsfw = st.checkbox("Include NSFW", value=False)
-            with col2:
-                min_comments = st.number_input("Min Comments", value=0, help="Minimum comment count")
-                include_spoilers = st.checkbox("Include Spoilers", value=True)
-            with col3:
-                min_awards = st.number_input("Min Awards", value=0, help="Minimum award count")
-                oc_only = st.checkbox("Original Content Only", value=False)
-        
-        # Category filters (like GummySearch)
-        with st.expander("🏷️ Category Filters (GummySearch Style)"):
-            st.markdown("**Filter by Content Categories:**")
-            categories = ["All Categories", "Pain Points", "Solution Requests", "Money Talk", "Hot Discussions", "Seeking Alternatives", "General Discussion"]
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                selected_categories = st.multiselect(
-                    "Select Categories",
-                    categories[1:],  # Exclude "All Categories" from multiselect
-                    default=[],
-                    help="Choose which types of content to include"
-                )
-            with col2:
-                min_confidence = st.slider(
-                    "Category Confidence",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.1,
-                    step=0.1,
-                    help="Minimum confidence for category classification"
-                )
-
-        # Action button with better styling
-        if st.button("🚀 Start Scraping", use_container_width=True):
-            with st.spinner("🔍 Collecting posts from r/{} ...".format(sub_name)):
-                df = get_subreddit_posts(
-                    reddit, sub_name,
-                    filter_type=filter_opt,
-                    start=start_d, end=end_d,
-                )
-
-            if not df.empty:
-                # Apply content filters
-                if min_score > 0:
-                    df = df[df['Score'] >= min_score]
-                if min_comments > 0:
-                    df = df[df['Total Comments'] >= min_comments]
-                if min_awards > 0:
-                    df = df[df['Total Awards'] >= min_awards]
-                if not include_nsfw:
-                    df = df[~df['Over 18']]
-                if not include_spoilers:
-                    df = df[~df['Spoiler']]
-                if oc_only:
-                    df = df[df['Is Original Content']]
-                
-                # Apply category filters (GummySearch style)
-                if selected_categories:
-                    df = df[df['Category'].isin(selected_categories)]
-                if min_confidence > 0:
-                    df = df[df['Category Confidence'] >= min_confidence]
-
-                st.success(f"✅ Successfully fetched {len(df)} posts from r/{sub_name}")
-                
-                # Stats dashboard
-                create_stats_dashboard(df)
-                
-                # Category analytics (GummySearch style)
-                create_category_analytics(df)
-                
-                # Charts section
-                if show_charts and len(df) > 0:
-                    st.markdown('<h3 class="section-header">📊 Analytics</h3>', unsafe_allow_html=True)
-                    
-                    chart_col1, chart_col2 = st.columns(2)
-                    
-                    with chart_col1:
-                        # Score distribution
-                        fig_score = px.histogram(
-                            df, x='Score', nbins=20,
-                            title="Score Distribution",
-                            color_discrete_sequence=['#FF4B4B']
-                        )
-                        fig_score.update_layout(
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            font_color='white'
-                        )
-                        st.plotly_chart(fig_score, use_container_width=True)
-                    
-                    with chart_col2:
-                        # Posts over time
-                        df['Date'] = pd.to_datetime(df['Created UTC']).dt.date
-                        posts_per_day = df.groupby('Date').size().reset_index(name='Posts')
-                        fig_time = px.line(
-                            posts_per_day, x='Date', y='Posts',
-                            title="Posts Over Time",
-                            color_discrete_sequence=['#00D4FF']
-                        )
-                        fig_time.update_layout(
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            font_color='white'
-                        )
-                        st.plotly_chart(fig_time, use_container_width=True)
-
-                # Data table with enhanced display
-                st.markdown('<h3 class="section-header">📋 Post Data</h3>', unsafe_allow_html=True)
-                
-                # Column selection
-                with st.expander("🔧 Customize Columns"):
-                    all_columns = df.columns.tolist()
-                    default_columns = ['Title', 'Category', 'Author', 'Score', 'Total Comments', 'Created UTC', 'Permalink']
-                    selected_columns = st.multiselect(
-                        "Select columns to display:",
-                        all_columns,
-                        default=[col for col in default_columns if col in all_columns]
-                    )
-                
-                display_df = df[selected_columns] if selected_columns else df
-                
-                # Enhanced dataframe display with category styling
-                if 'Category' in display_df.columns:
-                    # Create a copy for styling
-                    styled_df = display_df.copy()
-                    
-                    # Add category styling
-                    def style_category(val):
-                        color = get_category_color(val)
-                        icon = get_category_icon(val)
-                        return f"background-color: {color}20; color: {color}; font-weight: bold;"
-                    
-                    # Apply styling to Category column
-                    styled_df = styled_df.style.applymap(style_category, subset=['Category'])
-                    st.dataframe(styled_df, use_container_width=True, height=400)
-                else:
-                    st.dataframe(display_df, use_container_width=True, height=400)
-
-                # Download section
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.download_button(
-                        "📥 Download Full CSV",
-                        df.to_csv(index=False).encode(),
-                        f"{sub_name}_posts_full.csv",
-                        "text/csv",
-                        use_container_width=True
-                    )
-                with col2:
-                    if selected_columns:
-                        st.download_button(
-                            "📥 Download Selected CSV",
-                            display_df.to_csv(index=False).encode(),
-                            f"{sub_name}_posts_selected.csv",
-                            "text/csv",
-                            use_container_width=True
-                        )
-                with col3:
-                    # JSON download option
-                    st.download_button(
-                        "📥 Download JSON",
-                        df.to_json(orient='records', date_format='iso').encode(),
-                        f"{sub_name}_posts.json",
-                        "application/json",
-                        use_container_width=True
-                    )
+            if not keywords_list:
+                st.warning("Kam az kam ek keyword daalo۔")
             else:
-                st.error("❌ No posts found. Please check the subreddit name and try again.")
+                tbs      = TIME_FILTERS[time_label]
+                sub      = sub_filter.strip().lstrip("r/")
+                all_dfs  = []
+                progress = st.progress(0, "Searching...")
 
-    # ── Single-thread mode ─────────────────────────────────────────────────────
-    else:
-        st.markdown('<h2 class="section-header">🔗 Post URL Scraper</h2>', unsafe_allow_html=True)
+                for i, kw in enumerate(keywords_list):
+                    # Reddit pe subreddit filter bhi lagao
+                    q = f"r/{sub} {kw}" if (sub and platform == "🟠 Reddit") else kw
+                    progress.progress(
+                        int(i / len(keywords_list) * 100),
+                        f"Searching {platform}: '{kw}' ({i+1}/{len(keywords_list)})",
+                    )
+                    df_kw = serper_search(q, num=num_results, time_filter=tbs, platform=platform)
+                    if not df_kw.empty:
+                        df_kw.insert(0, "Keyword", kw)
+                        all_dfs.append(df_kw)
+                    time.sleep(0.5)
 
-        # URL input with validation
-        url = st.text_input(
-            "**Reddit Post URL**",
-            placeholder="https://www.reddit.com/r/subreddit/comments/post_id/title/",
-            help="Enter the full URL of the Reddit post you want to scrape"
-        )
-        
-        # Comment analysis options
-        with st.expander("🔧 Comment Analysis Options"):
-            col1, col2 = st.columns(2)
-            with col1:
-                include_deleted = st.checkbox("Include Deleted Comments", value=False)
-                sort_comments = st.selectbox("Sort Comments By", ["Score", "Date", "Author"])
-            with col2:
-                min_comment_score = st.number_input("Min Comment Score", value=-1000)
-                max_comments = st.number_input("Max Comments", value=1000, min_value=1)
+                progress.progress(100, "Done!")
 
-        if st.button("🚀 Scrape Post & Comments", use_container_width=True):
-            if url:
-                with st.spinner("📥 Fetching submission & comments..."):
-                    post_df, cmt_df = get_post_by_url(reddit, url)
-
-                if not post_df.empty:
-                    # Post details section
-                    st.markdown('<h3 class="section-header">📄 Post Details</h3>', unsafe_allow_html=True)
-                    
-                    # Display key metrics for the post
-                    if len(post_df) > 0:
-                        post = post_df.iloc[0]
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("👍 Score", int(post['Score']))
-                        with col2:
-                            st.metric("💬 Comments", int(post['Total Comments']))
-                        with col3:
-                            st.metric("🏆 Awards", int(post['Total Awards']))
-                        with col4:
-                            ratio = post['Up-vote Ratio']
-                            st.metric("📈 Upvote Ratio", f"{ratio:.1%}")
-                    
-                    # Post data table
-                    st.dataframe(post_df, use_container_width=True)
-
-                    # Comments section
-                    if not cmt_df.empty:
-                        # Filter comments
-                        filtered_cmt_df = cmt_df.copy()
-                        
-                        if min_comment_score > -1000:
-                            filtered_cmt_df = filtered_cmt_df[filtered_cmt_df['Score'] >= min_comment_score]
-                        
-                        if not include_deleted:
-                            filtered_cmt_df = filtered_cmt_df[
-                                ~filtered_cmt_df['Comment Text'].isin(['[deleted]', '[removed]'])
-                            ]
-                        
-                        # Sort comments
-                        if sort_comments == "Score":
-                            filtered_cmt_df = filtered_cmt_df.sort_values('Score', ascending=False)
-                        elif sort_comments == "Date":
-                            filtered_cmt_df = filtered_cmt_df.sort_values('Created UTC', ascending=False)
-                        elif sort_comments == "Author":
-                            filtered_cmt_df = filtered_cmt_df.sort_values('Author')
-                        
-                        # Limit comments
-                        if len(filtered_cmt_df) > max_comments:
-                            filtered_cmt_df = filtered_cmt_df.head(max_comments)
-                        
-                        st.markdown(f'<h3 class="section-header">💬 Comments ({len(filtered_cmt_df)} of {len(cmt_df)})</h3>', unsafe_allow_html=True)
-                        
-                        # Comment analytics
-                        if show_charts and len(filtered_cmt_df) > 0:
-                            chart_col1, chart_col2 = st.columns(2)
-                            
-                            with chart_col1:
-                                # Comment score distribution
-                                fig_comments = px.histogram(
-                                    filtered_cmt_df, x='Score', nbins=20,
-                                    title="Comment Score Distribution",
-                                    color_discrete_sequence=['#00D4FF']
-                                )
-                                fig_comments.update_layout(
-                                    plot_bgcolor='rgba(0,0,0,0)',
-                                    paper_bgcolor='rgba(0,0,0,0)',
-                                    font_color='white'
-                                )
-                                st.plotly_chart(fig_comments, use_container_width=True)
-                            
-                            with chart_col2:
-                                # Comments over time
-                                filtered_cmt_df['Date'] = pd.to_datetime(filtered_cmt_df['Created UTC']).dt.date
-                                comments_per_day = filtered_cmt_df.groupby('Date').size().reset_index(name='Comments')
-                                fig_cmt_time = px.line(
-                                    comments_per_day, x='Date', y='Comments',
-                                    title="Comments Over Time",
-                                    color_discrete_sequence=['#00FF88']
-                                )
-                                fig_cmt_time.update_layout(
-                                    plot_bgcolor='rgba(0,0,0,0)',
-                                    paper_bgcolor='rgba(0,0,0,0)',
-                                    font_color='white'
-                                )
-                                st.plotly_chart(fig_cmt_time, use_container_width=True)
-                        
-                        # Comments data table
-                        st.dataframe(filtered_cmt_df, use_container_width=True, height=400)
-                    else:
-                        st.info("No comments found for this post.")
-
-                    # Enhanced download section
-                    st.markdown('<h3 class="section-header">📥 Download Options</h3>', unsafe_allow_html=True)
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.download_button(
-                            "📄 Post CSV",
-                            post_df.to_csv(index=False).encode(),
-                            "post_details.csv",
-                            "text/csv",
-                            use_container_width=True
-                        )
-                    with col2:
-                        if not cmt_df.empty:
-                            st.download_button(
-                                "💬 Comments CSV",
-                                filtered_cmt_df.to_csv(index=False).encode(),
-                                "comments.csv",
-                                "text/csv",
-                                use_container_width=True
-                            )
-                    with col3:
-                        st.download_button(
-                            "📄 Post JSON",
-                            post_df.to_json(orient='records', date_format='iso').encode(),
-                            "post_details.json",
-                            "application/json",
-                            use_container_width=True
-                        )
-                    with col4:
-                        if not cmt_df.empty:
-                            st.download_button(
-                                "💬 Comments JSON",
-                                filtered_cmt_df.to_json(orient='records', date_format='iso').encode(),
-                                "comments.json",
-                                "application/json",
-                                use_container_width=True
-                            )
+                if not all_dfs:
+                    df = pd.DataFrame()
                 else:
-                    st.error("❌ Failed to fetch post data. Please check the URL and try again.")
-            else:
-                st.warning("⚠️ Please enter a valid Reddit post URL.")
+                    df = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["Link"])
+
+                if df.empty:
+                    st.error("Koi result nahi mila — keyword change karke try karein۔")
+                else:
+                    kw_label = keywords_list[0] if len(keywords_list) == 1 else "multi_keyword"
+                    st.success(f"✅ **{len(df)}** posts mili — **{len(keywords_list)}** keyword(s)")
+                    show_stats(df)
+                    if show_cats:
+                        show_categories(df)
+                    show_results_with_dm(df, preset, kw_label.replace(" ", "_"))
+
+    # ── Tab 2: Lead Tracker ───────────────────────────────────────────────────
+    with tab2:
+        show_lead_tracker()
+
+    # ── Tab 3: Daily Alerts ───────────────────────────────────────────────────
+    with tab3:
+        show_daily_alerts()
+
 
 if __name__ == "__main__":
     main()
