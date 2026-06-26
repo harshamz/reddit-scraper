@@ -427,8 +427,8 @@ def show_results_with_dm(df: pd.DataFrame, service_type: str, name: str):
 
             # DM Link
             with col2:
-                st.markdown(f"[💬 Open Reddit Post]({link})", unsafe_allow_html=False)
-                st.markdown("*Username Reddit par post mein milega*", unsafe_allow_html=False)
+                st.markdown(f"[🔗 Open Post]({link})", unsafe_allow_html=False)
+                st.markdown(f"*{plat} par jaake contact karein*", unsafe_allow_html=False)
 
             # Lead Status
             with col3:
@@ -607,7 +607,8 @@ def show_daily_alerts():
         if all_dfs:
             combined = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["Link"])
             st.success(f"✅ {len(combined)} new posts found!")
-            st.dataframe(combined[['Alert Keyword','Title','Subreddit','Date','Category','Link']],
+            show_cols = [c for c in ['Alert Keyword','Title','Platform','Source','Date','Category','Link'] if c in combined.columns]
+            st.dataframe(combined[show_cols],
                          use_container_width=True, height=400)
             st.download_button("📥 Download Results", combined.to_csv(index=False).encode(),
                                "alert_results.csv", "text/csv")
