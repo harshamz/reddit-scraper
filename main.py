@@ -33,20 +33,41 @@ ALERTS_FILE    = Path("alerts.json")
 
 # ──────────────────────────── Lead Tracker Storage ───────────────────────────
 def load_leads() -> dict:
-    if LEADS_FILE.exists():
-        return json.loads(LEADS_FILE.read_text(encoding="utf-8"))
-    return {}
+    # Session state is primary — survives widget reruns within a session
+    if "leads_data" not in st.session_state:
+        if LEADS_FILE.exists():
+            try:
+                st.session_state["leads_data"] = json.loads(LEADS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                st.session_state["leads_data"] = {}
+        else:
+            st.session_state["leads_data"] = {}
+    return st.session_state["leads_data"]
 
 def save_leads(data: dict):
-    LEADS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    st.session_state["leads_data"] = data
+    try:
+        LEADS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # Streamlit Cloud filesystem may be read-only; session state still holds data
 
 def load_alerts() -> list:
-    if ALERTS_FILE.exists():
-        return json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
-    return []
+    if "alerts_data" not in st.session_state:
+        if ALERTS_FILE.exists():
+            try:
+                st.session_state["alerts_data"] = json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                st.session_state["alerts_data"] = []
+        else:
+            st.session_state["alerts_data"] = []
+    return st.session_state["alerts_data"]
 
 def save_alerts(data: list):
-    ALERTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    st.session_state["alerts_data"] = data
+    try:
+        ALERTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ──────────────────────────── Category System ────────────────────────────────
@@ -732,11 +753,23 @@ def main():
                     st.error("No results found — try different keywords.")
                 else:
                     kw_label = keywords_list[0] if len(keywords_list) == 1 else "multi_keyword"
-                    st.success(f"✅ **{len(df)}** posts found — **{len(keywords_list)}** keyword(s)")
-                    show_stats(df)
-                    if show_cats:
-                        show_categories(df)
-                    show_results_with_dm(df, preset, kw_label.replace(" ", "_"))
+                    # Store results in session state so widget interactions don't wipe them
+                    st.session_state["search_df"]      = df
+                    st.session_state["search_preset"]  = preset
+                    st.session_state["search_kw_label"] = kw_label.replace(" ", "_")
+                    st.session_state["show_cats"]      = show_cats
+
+        # Render results from session state (survives widget clicks / reruns)
+        if "search_df" in st.session_state and not st.session_state["search_df"].empty:
+            df       = st.session_state["search_df"]
+            _preset  = st.session_state.get("search_preset", preset)
+            _label   = st.session_state.get("search_kw_label", "results")
+            _cats    = st.session_state.get("show_cats", True)
+            st.success(f"✅ **{len(df)}** posts found")
+            show_stats(df)
+            if _cats:
+                show_categories(df)
+            show_results_with_dm(df, _preset, _label)
 
     # ── Tab 2: Lead Tracker ───────────────────────────────────────────────────
     with tab2:
