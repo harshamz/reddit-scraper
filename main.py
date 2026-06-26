@@ -642,7 +642,7 @@ def show_daily_alerts():
 # ──────────────────────────── Main ───────────────────────────────────────────
 def main():
     st.set_page_config(
-        page_title="Reddit SMM Lead Finder",
+        page_title="FIG Lead Finder",
         page_icon="reddit-logo.png",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -654,10 +654,10 @@ def main():
         st.markdown(f'''
         <div style="display:flex;align-items:center;justify-content:center;margin-bottom:1rem;">
             <img src="data:image/png;base64,{logo}" width="45" style="margin-right:12px;">
-            <h1 class="main-header" style="margin:0;">Reddit SMM Lead Finder</h1>
+            <h1 class="main-header" style="margin:0;">FIG Lead Finder</h1>
         </div>''', unsafe_allow_html=True)
     except Exception:
-        st.markdown('<h1 class="main-header">Reddit SMM Lead Finder</h1>', unsafe_allow_html=True)
+        st.markdown('<h1 class="main-header">FIG Lead Finder</h1>', unsafe_allow_html=True)
 
     st.markdown(
         '<p style="text-align:center;color:#A6A6A6;margin-top:-0.8rem;">'
@@ -790,7 +790,7 @@ def check_login() -> bool:
         return True
 
     st.set_page_config(
-        page_title="Login — Reddit SMM Lead Finder",
+        page_title="Login — FIG Lead Finder",
         page_icon="🔒",
         layout="centered",
     )
