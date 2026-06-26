@@ -24,6 +24,8 @@ def _get_secret(key: str) -> str:
     return val
 
 SERPER_API_KEY = _get_secret("SERPER_API_KEY")
+APP_USERNAME   = _get_secret("APP_USERNAME")
+APP_PASSWORD   = _get_secret("APP_PASSWORD")
 SERPER_URL     = "https://google.serper.dev/search"
 LEADS_FILE     = Path("leads_tracker.json")
 ALERTS_FILE    = Path("alerts.json")
@@ -745,5 +747,43 @@ def main():
         show_daily_alerts()
 
 
+# ──────────────────────────── Login Gate ─────────────────────────────────────
+def check_login() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+
+    # If no credentials configured, allow open access
+    if not APP_USERNAME or not APP_PASSWORD:
+        return True
+
+    st.set_page_config(
+        page_title="Login — Reddit SMM Lead Finder",
+        page_icon="🔒",
+        layout="centered",
+    )
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+    .stApp { background:linear-gradient(135deg,#0E1117 0%,#1a1d29 100%); font-family:'Inter',sans-serif; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        st.markdown("## 🔒 Login Required")
+        st.markdown("Enter your credentials to access the app.")
+        username = st.text_input("Username", placeholder="Enter username")
+        password = st.text_input("Password", type="password", placeholder="Enter password")
+        if st.button("Login", use_container_width=True):
+            if username == APP_USERNAME and password == APP_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+    return False
+
+
 if __name__ == "__main__":
-    main()
+    if check_login():
+        main()
