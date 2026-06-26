@@ -428,7 +428,7 @@ def show_results_with_dm(df: pd.DataFrame, service_type: str, name: str):
             # DM Link
             with col2:
                 st.markdown(f"[🔗 Open Post]({link})", unsafe_allow_html=False)
-                st.markdown(f"*{plat} par jaake contact karein*", unsafe_allow_html=False)
+                st.markdown(f"*Visit {plat} to contact them*", unsafe_allow_html=False)
 
             # Lead Status
             with col3:
@@ -471,7 +471,7 @@ def show_results_with_dm(df: pd.DataFrame, service_type: str, name: str):
 
     # Show copied message
     if "copied_msg" in st.session_state:
-        st.markdown('<div class="sec-header">📋 DM Message (Copy karein)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-header">📋 DM Message (Copy Below)</div>', unsafe_allow_html=True)
         st.text_area("Message:", value=st.session_state["copied_msg"], height=150, key="msg_display")
 
     # Download
@@ -490,7 +490,7 @@ def show_lead_tracker():
     leads_data = load_leads()
 
     if not leads_data:
-        st.info("Koi lead save nahi ki abhi — pehle search karein aur '➕ Save Lead' click karein۔")
+        st.info("No leads saved yet — search first and click '➕ Save Lead' to add them here.")
         return
 
     # Stats
@@ -551,7 +551,7 @@ def show_daily_alerts():
     st.markdown('<div class="sec-header">🔔 Daily Auto Alerts</div>', unsafe_allow_html=True)
     alerts = load_alerts()
 
-    st.markdown("**Yahan keywords save karo — har baar app kholne par naye results dikhenge۔**")
+    st.markdown("**Save keywords here — new results will appear every time you open the app.**")
 
     with st.form("add_alert"):
         col1, col2, col3 = st.columns([3, 1, 1])
@@ -574,7 +574,7 @@ def show_daily_alerts():
             st.rerun()
 
     if not alerts:
-        st.info("Koi alert nahi — upar se add karein۔")
+        st.info("No alerts yet — add one above.")
         return
 
     st.markdown("---")
@@ -582,7 +582,7 @@ def show_daily_alerts():
     for i, alert in enumerate(alerts):
         col1, col2 = st.columns([5, 1])
         with col1:
-            sub_txt = f" in r/{alert['subreddit']}" if alert.get("subreddit") else " (all Reddit)"
+            sub_txt = f" in r/{alert['subreddit']}" if alert.get("subreddit") else " (all platforms)"
             st.markdown(f"🔔 **{alert['keyword']}**{sub_txt} — _{alert['time_label']}_")
         with col2:
             if st.button("❌", key=f"del_alert_{i}"):
@@ -613,7 +613,7 @@ def show_daily_alerts():
             st.download_button("📥 Download Results", combined.to_csv(index=False).encode(),
                                "alert_results.csv", "text/csv")
         else:
-            st.warning("Koi naya result nahi mila۔")
+            st.warning("No new results found.")
 
 
 # ──────────────────────────── Main ───────────────────────────────────────────
@@ -676,7 +676,7 @@ def main():
         c1, c2, c3 = st.columns([3, 1, 1])
         with c1:
             keywords_input = st.text_area(
-                "**Keywords** (ek line mein ek — ya comma se alag karein)",
+                "**Keywords** (one per line — or separate with commas)",
                 value=default_kw,
                 placeholder="need social media manager\nhire animator\nbuild me a website",
                 height=110,
@@ -686,12 +686,12 @@ def main():
         with c3:
             platform = st.selectbox("**Platform**", list(PLATFORMS.keys()), index=0)
 
-        # Subreddit filter — sirf Reddit ke liye show karo
+        # Subreddit filter — only shown for Reddit platform
         sub_filter = ""
         if platform == "🟠 Reddit":
             sub_filter = st.text_input(
                 "**Subreddit filter** (optional)",
-                placeholder="forhire  (khali chhodo = poora Reddit)",
+                placeholder="forhire  (leave blank = all of Reddit)",
             )
 
         if st.button("🚀 Find Clients", use_container_width=True):
@@ -699,7 +699,7 @@ def main():
             keywords_list = [k.strip() for k in raw.splitlines() if k.strip()]
 
             if not keywords_list:
-                st.warning("Kam az kam ek keyword daalo۔")
+                st.warning("Please enter at least one keyword.")
             else:
                 tbs      = TIME_FILTERS[time_label]
                 sub      = sub_filter.strip().lstrip("r/")
@@ -707,7 +707,7 @@ def main():
                 progress = st.progress(0, "Searching...")
 
                 for i, kw in enumerate(keywords_list):
-                    # Reddit pe subreddit filter bhi lagao
+                    # Apply subreddit filter for Reddit platform
                     q = f"r/{sub} {kw}" if (sub and platform == "🟠 Reddit") else kw
                     progress.progress(
                         int(i / len(keywords_list) * 100),
@@ -727,10 +727,10 @@ def main():
                     df = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["Link"])
 
                 if df.empty:
-                    st.error("Koi result nahi mila — keyword change karke try karein۔")
+                    st.error("No results found — try different keywords.")
                 else:
                     kw_label = keywords_list[0] if len(keywords_list) == 1 else "multi_keyword"
-                    st.success(f"✅ **{len(df)}** posts mili — **{len(keywords_list)}** keyword(s)")
+                    st.success(f"✅ **{len(df)}** posts found — **{len(keywords_list)}** keyword(s)")
                     show_stats(df)
                     if show_cats:
                         show_categories(df)
