@@ -1,6 +1,5 @@
-requests==2.32.3
-pandas==2.1.4
-streamlit==1.48.1
-plotly==5.18.0
-python-dotenv==1.1.1
-narwhals>=1.15.1
+requests>=2.32.0
+pandas>=2.2.0
+streamlit>=1.45.0
+plotly>=5.18.0
+python-dotenv>=1.0.0
