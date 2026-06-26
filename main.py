@@ -253,6 +253,64 @@ def serper_search(query: str, num: int = 30, time_filter: str = "qdr:m",
     return pd.DataFrame(rows)
 
 
+# ──────────────────────────── Lead Enrichment ────────────────────────────────
+def extract_emails(text: str) -> List[str]:
+    pattern = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+    return list(set(re.findall(pattern, text)))
+
+def extract_phones(text: str) -> List[str]:
+    pattern = r'(?:\+?\d{1,3}[\s\-.]?)?\(?\d{2,4}\)?[\s\-.]?\d{3,4}[\s\-.]?\d{3,5}'
+    found = re.findall(pattern, text)
+    # Filter out short/junk matches
+    return list(set(p.strip() for p in found if len(re.sub(r'\D', '', p)) >= 7))
+
+def enrich_lead(title: str, link: str) -> dict:
+    """Search Google for contact info related to this lead."""
+    if not SERPER_API_KEY:
+        return {}
+
+    results = {"emails": [], "phones": [], "names": [], "raw_snippets": []}
+
+    # Build enrichment queries
+    domain = ""
+    for part in link.split("/"):
+        if "." in part and part not in ("reddit.com", "x.com", "facebook.com", "linkedin.com"):
+            domain = part
+            break
+
+    queries = [
+        f'"{title[:60]}" email contact',
+        f'"{title[:60]}" phone number',
+    ]
+    if domain:
+        queries.append(f'site:{domain} email contact phone')
+
+    for q in queries:
+        try:
+            r = requests.post(
+                SERPER_URL,
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": q, "num": 5},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            for item in data.get("organic", []):
+                text = f"{item.get('title','')} {item.get('snippet','')} {item.get('link','')}"
+                results["raw_snippets"].append(item.get("snippet", ""))
+                results["emails"] += extract_emails(text)
+                results["phones"] += extract_phones(text)
+        except Exception:
+            continue
+
+    # Deduplicate
+    results["emails"] = list(set(results["emails"]))[:5]
+    results["phones"] = list(set(results["phones"]))[:5]
+    results["raw_snippets"] = results["raw_snippets"][:3]
+    return results
+
+
 # ──────────────────────────── DM Template Generator ──────────────────────────
 DM_TEMPLATES = {
     "🎯 SMM Clients": (
@@ -534,11 +592,13 @@ def show_lead_tracker():
     # Filter by status
     filter_status = st.selectbox("Filter by status:", ["All"] + STATUS_OPTIONS)
 
-    for lead_id, info in leads_data.items():
+    for idx, (lead_id, info) in enumerate(leads_data.items()):
         if filter_status != "All" and info.get("status") != filter_status:
             continue
-        status = info.get("status", "🆕 New")
-        color  = STATUS_COLORS.get(status, "#666666")
+        status  = info.get("status", "🆕 New")
+        color   = STATUS_COLORS.get(status, "#666666")
+        enriched = info.get("enriched", {})
+
         st.markdown(f"""
         <div style="background:#1A1D23;border-left:4px solid {color};
             border-radius:8px;padding:0.8rem;margin:0.4rem 0;">
@@ -555,11 +615,56 @@ def show_lead_tracker():
             </div>
         </div>""", unsafe_allow_html=True)
 
+        # Show enriched data if available
+        if enriched:
+            emails = enriched.get("emails", [])
+            phones = enriched.get("phones", [])
+            snippets = enriched.get("raw_snippets", [])
+            if emails or phones:
+                ecol1, ecol2 = st.columns(2)
+                with ecol1:
+                    if emails:
+                        st.markdown("**📧 Emails found:**")
+                        for e in emails:
+                            st.code(e, language=None)
+                    else:
+                        st.caption("📧 No email found")
+                with ecol2:
+                    if phones:
+                        st.markdown("**📞 Phones found:**")
+                        for p in phones:
+                            st.code(p, language=None)
+                    else:
+                        st.caption("📞 No phone found")
+                if snippets:
+                    with st.expander("🔍 View raw search snippets"):
+                        for s in snippets:
+                            st.caption(s)
+            else:
+                st.caption("🔍 Enrichment ran — no contact info found publicly.")
+
+        # Enrich button
+        if st.button("🔍 Enrich Contact Info", key=f"enrich_{idx}"):
+            with st.spinner("Searching for contact info..."):
+                result = enrich_lead(info.get("title", ""), info.get("link", ""))
+                leads_data[lead_id]["enriched"] = result
+                save_leads(leads_data)
+            st.rerun()
+
+        st.divider()
+
     # Export tracker
     st.markdown("---")
     tracker_df = pd.DataFrame([
-        {"Title": v.get("title",""), "Status": v.get("status",""),
-         "Note": v.get("note",""), "Link": v.get("link",""), "Date": v.get("saved_at","")}
+        {
+            "Title":   v.get("title", ""),
+            "Status":  v.get("status", ""),
+            "Note":    v.get("note", ""),
+            "Link":    v.get("link", ""),
+            "Date":    v.get("saved_at", ""),
+            "Emails":  ", ".join(v.get("enriched", {}).get("emails", [])),
+            "Phones":  ", ".join(v.get("enriched", {}).get("phones", [])),
+        }
         for v in leads_data.values()
     ])
     st.download_button("📥 Export Tracker CSV", tracker_df.to_csv(index=False).encode(),
